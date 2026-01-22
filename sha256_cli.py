@@ -64,6 +64,50 @@ def _pad_message(message: bytes) -> bytes:
     return bytes(padded)
 
 
+def _pad_message_bits(message_bytes: bytes, length_bits: int) -> bytes:
+    """Pad a message with explicit bit length according to SHA-256 specification.
+    
+    This supports non-byte-aligned messages where the actual message length
+    in bits is less than len(message_bytes) * 8.
+    
+    Args:
+        message_bytes: The message bytes (may have unused bits in last byte)
+        length_bits: The actual message length in bits
+    
+    Returns:
+        Padded message as bytes (multiple of 64 bytes)
+    """
+    padded = bytearray(message_bytes)
+    
+    # Calculate how many complete bytes and remaining bits
+    remaining_bits = length_bits % 8
+    
+    if remaining_bits == 0:
+        # Message ends on byte boundary - append 0x80
+        padded.append(0x80)
+    else:
+        # Message has partial last byte - set the bit after the message
+        # The last byte already contains the message bits in the high positions
+        # We need to set the next bit to 1 and clear any lower bits
+        
+        # Mask to keep only the message bits (high 'remaining_bits' bits)
+        mask = (0xFF << (8 - remaining_bits)) & 0xFF
+        # The '1' bit to append (immediately after message bits)
+        one_bit = 0x80 >> remaining_bits
+        
+        # Update the last byte: keep message bits, add '1' bit, clear rest
+        padded[-1] = (padded[-1] & mask) | one_bit
+    
+    # Pad with zeros until length ≡ 56 mod 64 (448 bits mod 512)
+    while (len(padded) % 64) != 56:
+        padded.append(0x00)
+    
+    # Append 64-bit big-endian length in BITS
+    padded.extend(length_bits.to_bytes(8, byteorder="big"))
+    
+    return bytes(padded)
+
+
 def _chunks(data: bytes, size: int) -> Iterable[bytes]:
     """Yield successive `size`-byte chunks from `data`."""
     for i in range(0, len(data), size):
@@ -308,6 +352,35 @@ def sha256_before(
     return state, schedules
 
 
+def sha256_before_bits(
+    message_bytes: bytes,
+    length_bits: int,
+) -> tuple[tuple[int, int, int, int, int, int, int, int], List[List[int]]]:
+    """High-level helper for bit-level messages.
+    
+    Like sha256_before, but supports non-byte-aligned messages where the
+    actual message length in bits may be less than len(message_bytes) * 8.
+
+    Args:
+        message_bytes: The message bytes (may have unused bits in last byte)
+        length_bits: The actual message length in bits
+
+    Returns:
+        - The initial 8-word state, and
+        - A list of message schedules, one per 512-bit block.
+    """
+    state: tuple[int, int, int, int, int, int, int, int] = tuple(_H0)
+
+    padded = _pad_message_bits(message_bytes, length_bits)
+
+    schedules: List[List[int]] = []
+    for block in _chunks(padded, 64):
+        _, ws = _before_compress_round(block, state)
+        schedules.append(ws)
+
+    return state, schedules
+
+
 def sha256_after(
     final_state: tuple[int, int, int, int, int, int, int, int]
 ) -> bytes:
@@ -348,6 +421,68 @@ def sha256(data: bytes) -> bytes:
 
     # Finalize and return the digest from the final state.
     return sha256_after(state)
+
+
+def sha256_with_h_tracking(
+    data: bytes,
+) -> tuple[bytes, List[List[int]]]:
+    """Compute SHA-256 while tracking h register values at each round.
+    
+    Returns:
+        (digest, h_values_per_block)
+        where h_values_per_block[block_idx] is a list of 64 h values for that block
+    """
+    state, schedules = sha256_before(data)
+    all_h_values: List[List[int]] = []
+
+    for ws in schedules:
+        result = compress64(*state, ws, track_h=True)
+        work_out, h_values = result
+        all_h_values.append(h_values)
+        state = _after_compress_round(state, *work_out)
+
+    return sha256_after(state), all_h_values
+
+
+def sha256_bits(message_bytes: bytes, length_bits: int) -> bytes:
+    """Compute SHA-256 for a message with explicit bit length.
+    
+    Supports non-byte-aligned messages where the actual message length
+    in bits may be less than len(message_bytes) * 8.
+    """
+    state, schedules = sha256_before_bits(message_bytes, length_bits)
+
+    for ws in schedules:
+        a, b, c, d, e, f, g, h_out = compress64(*state, ws)
+        state = _after_compress_round(state, a, b, c, d, e, f, g, h_out)
+
+    return sha256_after(state)
+
+
+def sha256_bits_with_h_tracking(
+    message_bytes: bytes,
+    length_bits: int,
+) -> tuple[bytes, List[List[int]]]:
+    """Compute SHA-256 for bit-level message while tracking h values.
+    
+    Args:
+        message_bytes: The message bytes (may have unused bits in last byte)
+        length_bits: The actual message length in bits
+    
+    Returns:
+        (digest, h_values_per_block)
+        where h_values_per_block[block_idx] is a list of 64 h values for that block
+    """
+    state, schedules = sha256_before_bits(message_bytes, length_bits)
+    all_h_values: List[List[int]] = []
+
+    for ws in schedules:
+        result = compress64(*state, ws, track_h=True)
+        work_out, h_values = result
+        all_h_values.append(h_values)
+        state = _after_compress_round(state, *work_out)
+
+    return sha256_after(state), all_h_values
 
 
 def _hexdigest(data: bytes) -> str:

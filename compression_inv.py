@@ -6,13 +6,29 @@ state, and we compute as much of the *pre-round* state.
 
 from __future__ import annotations
 
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from compress import K_VALUES, _rotr
 
 from sha256_cli import _H0
 
 MASK32 = 0xFFFFFFFF
+
+
+def solve_w_from_h(
+    temp_1: int, prev_e: int, prev_f: int, prev_g: int, k: int, h_prev: int
+) -> int:
+    """Given temp1, pre-round (e, f, g), k, and h_prev, compute w.
+    
+    From the equation: temp1 = h + S1(e) + ch(e, f, g) + k + w
+    We solve: w = temp1 - h - S1(e) - ch(e, f, g) - k
+    """
+    S1 = _rotr(prev_e, 6) ^ _rotr(prev_e, 11) ^ _rotr(prev_e, 25)
+    ch = (prev_e & prev_f) ^ ((~prev_e) & prev_g)
+    offset = (S1 + ch + k) & MASK32
+    w = (temp_1 - offset - h_prev) & MASK32
+    return w
+
 
 def solve_temp1_w(temp_1: int, prev_e: int, prev_f: int, prev_g: int, k: int, w: int) -> int:
     """Given temp1, pre-round (e, f, g), and w, return one consistent h."""
@@ -27,6 +43,7 @@ def solve_temp1_w(temp_1: int, prev_e: int, prev_f: int, prev_g: int, k: int, w:
     h_prev = (temp_1 - offset - w) & MASK32
 
     return h_prev
+
 
 def solve_temp1(
     temp_1: int, prev_e: int, prev_f: int, prev_g: int, k: int
@@ -95,6 +112,8 @@ def compression_inv(
     g: int,
     h: int,
     k: int,
+    *,
+    known_h_prev: Optional[int] = None,
 ) -> Tuple[int, int, int, int, int, int, int, int, int]:
     """Partially invert the SHA-256 step 7 state update.
 
@@ -102,6 +121,12 @@ def compression_inv(
     ----------
     a, b, c, d, e, f, g, h : int
         32-bit words representing the *post-round* working state.
+    k : int
+        Round constant for this round.
+    known_h_prev : int, optional
+        If provided, use this as the h value for the pre-round state instead
+        of computing/guessing it. When provided, w is computed directly from
+        the temp1 equation without any special-case overrides.
 
     Returns
     -------
@@ -168,14 +193,16 @@ def compression_inv(
     temp_1 = (a - temp2) & MASK32
     d_prev = (e - temp_1) & MASK32
 
-    # Now fill in d, h, w
-    # temp1 constraints
-    (candidate_h, candidate_w) = solve_temp1(temp_1, e_prev, f_prev, g_prev, k)
-
-    h_prev = candidate_h
-    w = candidate_w
-
-    # FIXME: a..h are known at 0 (initial state)
+    # Now fill in h_prev and w
+    if known_h_prev is not None:
+        # Use the provided h value and compute w directly (no overrides)
+        h_prev = known_h_prev & MASK32
+        w = solve_w_from_h(temp_1, e_prev, f_prev, g_prev, k, h_prev)
+    else:
+        # Use the heuristic solver with special-case overrides
+        (candidate_h, candidate_w) = solve_temp1(temp_1, e_prev, f_prev, g_prev, k)
+        h_prev = candidate_h
+        w = candidate_w
 
     # All words are reduced modulo 2^32 for consistency with SHA-256 arithmetic.
     return (
@@ -200,6 +227,8 @@ def compression64_inv(
     f: int,
     g: int,
     h: int,
+    *,
+    h_values: Optional[Sequence[int]] = None,
 ) -> Tuple[int, int, int, int, int, int, int, int, Tuple[int, ...]]:
     """Invert the full 64-round SHA-256 compression loop.
 
@@ -207,13 +236,34 @@ def compression64_inv(
     using ``compression_inv`` to recover a consistent preimage and the
     corresponding message schedule words ``w[i]``.
 
+    Parameters
+    ----------
+    a, b, c, d, e, f, g, h : int
+        32-bit words representing the *post-64-round* working state.
+    h_values : Sequence[int], optional
+        If provided, must be a sequence of 64 h register values (one per round).
+        h_values[i] is the h register value at the START of round i in the
+        forward direction. When provided, these values are used directly instead
+        of heuristic guessing, enabling exact recovery of the original preimage.
+
+    Returns
+    -------
+    (a, b, c, d, e, f, g, h, ws) : tuple
+        The recovered pre-compression state and the 64-word message schedule.
+
     This mirrors ``compress64`` in ``compress.py``.
     """
+    if h_values is not None and len(h_values) != 64:
+        raise ValueError(f"h_values must have exactly 64 elements, got {len(h_values)}")
+
     # We'll accumulate recovered w[i] from the end backwards.
     ws_rev: List[int] = []
 
     a_i, b_i, c_i, d_i, e_i, f_i, g_i, h_i = a, b, c, d, e, f, g, h
     for i in reversed(range(64)):
+        # Get the known h_prev for this round if provided
+        known_h = h_values[i] if h_values is not None else None
+        
         (
             a_i,
             b_i,
@@ -224,7 +274,7 @@ def compression64_inv(
             g_i,
             h_i,
             w_i,
-        ) = compression_inv(a_i, b_i, c_i, d_i, e_i, f_i, g_i, h_i, K_VALUES[i])
+        ) = compression_inv(a_i, b_i, c_i, d_i, e_i, f_i, g_i, h_i, K_VALUES[i], known_h_prev=known_h)
         ws_rev.append(w_i)
 
     # Reverse to get w[0]..w[63]

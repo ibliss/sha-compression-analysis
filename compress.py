@@ -199,7 +199,9 @@ def compress64(
     g: int,
     h: int,
     ws: Sequence[int],
-) -> Tuple[int, int, int, int, int, int, int, int]:
+    *,
+    track_h: bool = False,
+) -> Tuple[int, int, int, int, int, int, int, int] | Tuple[Tuple[int, int, int, int, int, int, int, int], List[int]]:
     """Run the full 64-round SHA-256 compression loop for one block.
 
     Parameters
@@ -208,17 +210,28 @@ def compress64(
         Initial working state words (typically the current hash value).
     ws : Sequence[int]
         The 64-word message schedule `w[0..63]` for this block.
+    track_h : bool, optional
+        If True, also return the h register value at the start of each round.
 
     Returns
     -------
-    (a, b, c, d, e, f, g, h) : tuple[int, ...]
-        Final working state words after 64 rounds.
+    If track_h is False (default):
+        (a, b, c, d, e, f, g, h) : tuple[int, ...]
+            Final working state words after 64 rounds.
+    If track_h is True:
+        ((a, b, c, d, e, f, g, h), h_values) : tuple[tuple[int, ...], list[int]]
+            Final working state and list of h values at start of each round.
     """
     if len(ws) != 64:
         raise ValueError(f"compress64 expects 64 message schedule words, got {len(ws)}")
 
+    h_values: List[int] = [] if track_h else None
+
     a_, b_, c_, d_, e_, f_, g_, h_ = a, b, c, d, e, f, g, h
     for i in range(64):
+        if track_h:
+            h_values.append(h_)
+        
         a_, b_, c_, d_, e_, f_, g_, h_ = compression(
             a_,
             b_,
@@ -232,5 +245,9 @@ def compress64(
             K_VALUES[i],
         )
 
-    return a_ & MASK32, b_ & MASK32, c_ & MASK32, d_ & MASK32, e_ & MASK32, f_ & MASK32, g_ & MASK32, h_ & MASK32
+    final_state = (a_ & MASK32, b_ & MASK32, c_ & MASK32, d_ & MASK32, e_ & MASK32, f_ & MASK32, g_ & MASK32, h_ & MASK32)
+    
+    if track_h:
+        return final_state, h_values
+    return final_state
 

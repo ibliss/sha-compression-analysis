@@ -7,12 +7,17 @@ We:
 - Run `compression64_inv` on that intermediate state and verify we recover:
   - the pre-round working state, and
   - the original message schedule words `w[0..63]`.
+
+With `--use-h-values` flag:
+- Track h register values during forward compression using `track_h=True`.
+- Pass these h values to `compression64_inv` for exact inversion.
+- Verification still uses standard SHA functions (no h internals).
 """
 
 from __future__ import annotations
 
 import argparse
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 from compress import MASK32, compress64
 from compression_inv import compression64_inv
@@ -35,18 +40,23 @@ def _format_state(state: Tuple[int, int, int, int, int, int, int, int]) -> str:
     return " ".join(f"{w:08x}" for w in state)
 
 
-def run_experiment(msg: bytes) -> None:
+def run_experiment(msg: bytes, *, use_h_values: bool = False) -> None:
     # Compute the expected hash for the input message.
     expected_hex = sha256(msg).hex()
 
     # High-level SHA-256 using our CLI helpers.
     initial_state, schedules = sha256_before(msg)
 
+    if use_h_values:
+        print("=== Using h-value tracking for exact inversion ===\n")
+
     # The message "hello world" fits into a single 512-bit block after padding,
     # but we keep the loop general in case this code is reused.
     state = initial_state
     preimage_blocks: list[bytes] = []
     recovered_schedules: list[tuple[int, ...]] = []
+    all_h_values: list[list[int]] = []
+    
     for block_idx, ws in enumerate(schedules):
         print(f"=== Block {block_idx} ===")
         
@@ -56,14 +66,23 @@ def run_experiment(msg: bytes) -> None:
             print("  ", _format_state(state))
 
         # Forward compression loop.
-        work_out = compress64(*state, ws)
+        if use_h_values:
+            # Track h values during forward compression
+            result = compress64(*state, ws, track_h=True)
+            work_out, h_values = result
+            all_h_values.append(h_values)
+        else:
+            work_out = compress64(*state, ws)
+            h_values = None
+            
         print("forward working state (post-64-round):")
         print("  ", _format_state(work_out))
 
         # Invert the 64-round compression loop from the post-round state.
         ### XXX: inv_ws[13,14,15] must be set correctly to control the last 9 bytes of the block
         inv_a, inv_b, inv_c, inv_d, inv_e, inv_f, inv_g, inv_h, inv_ws = compression64_inv(
-            *work_out
+            *work_out,
+            h_values=h_values,
         )
         inv_state = (inv_a, inv_b, inv_c, inv_d, inv_e, inv_f, inv_g, inv_h)
 
@@ -225,10 +244,16 @@ if __name__ == "__main__":
         required=True,
         help="Input file to process",
     )
+    parser.add_argument(
+        "--use-h-values",
+        action="store_true",
+        help="Track h register values during forward compression and use them "
+             "for exact inversion (recovers original message schedule)",
+    )
     args = parser.parse_args()
     
     with open(args.file, "rb") as f:
         msg = f.read()
     
-    run_experiment(msg)
+    run_experiment(msg, use_h_values=args.use_h_values)
 

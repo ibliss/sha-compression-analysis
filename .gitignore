@@ -99,6 +99,7 @@ venv.bak/
 # data/*.in
 # *.hash
 # *.in
+data/length
 
 # Test files
 # test_*.py
