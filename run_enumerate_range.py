@@ -6,7 +6,8 @@ for each value in the range [start, end] (inclusive).
 Usage:
     python run_enumerate_range.py <start> <end>
     python run_enumerate_range.py 0 8      # Runs for lengths 0, 1, 2, ..., 8
-    python run_enumerate_range.py 4 6     # Runs for lengths 4, 5, 6
+    python run_enumerate_range.py 4 6      # Runs for lengths 4, 5, 6
+    python run_enumerate_range.py 0 8 --format sqlite  # Output to SQLite
 """
 
 from __future__ import annotations
@@ -30,6 +31,13 @@ def main():
         type=int,
         help="End message length (inclusive)",
     )
+    parser.add_argument(
+        "--format",
+        type=str,
+        choices=["yaml", "sqlite"],
+        default="yaml",
+        help="Output format: yaml or sqlite (default: yaml)",
+    )
     args = parser.parse_args()
 
     start = args.start
@@ -44,6 +52,7 @@ def main():
         sys.exit(1)
 
     print(f"Running enumerate_h_values.py for lengths {start} to {end} (inclusive)")
+    print(f"Output format: {args.format}")
     print(f"Total runs: {end - start + 1}\n")
 
     for length in range(start, end + 1):
@@ -53,7 +62,7 @@ def main():
         
         try:
             result = subprocess.run(
-                [sys.executable, "enumerate_h_values.py", str(length)],
+                [sys.executable, "enumerate_h_values.py", str(length), "--format", args.format],
                 check=True,
                 capture_output=False,  # Show output in real-time
             )

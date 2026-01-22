@@ -3,7 +3,7 @@
 For small message lengths, this script:
 1. Generates all possible messages (2^N for N bits)
 2. Computes SHA-256 while tracking the h register at each round
-3. Saves results to data/length/N.yaml
+3. Saves results to data/length/N.yaml or N.db (SQLite)
 
 Usage:
     python enumerate_h_values.py <message_length_bits>
@@ -11,12 +11,21 @@ Usage:
     python enumerate_h_values.py 1      # 2 messages (0, 1)
     python enumerate_h_values.py 8      # 256 messages (1 byte)
     python enumerate_h_values.py 16     # 65536 messages (2 bytes)
+
+    # Output to SQLite database instead of YAML
+    python enumerate_h_values.py 16 --format sqlite
+
+SQLite Schema:
+    - metadata: message_length_bits, message_length_bytes, total_messages
+    - messages: id, message_bits, message_hex, digest_hex
+    - h_values: message_id, block_index, round_index, h_value
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import sys
 from typing import Dict, Generator, List, Tuple
 
@@ -78,6 +87,13 @@ def main():
         default="data/length",
         help="Output directory (default: data/length)",
     )
+    parser.add_argument(
+        "--format",
+        type=str,
+        choices=["yaml", "sqlite"],
+        default="yaml",
+        help="Output format: yaml or sqlite (default: yaml)",
+    )
     args = parser.parse_args()
 
     length_bits = args.length_bits
@@ -98,7 +114,14 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Enumerate all messages and collect h values
+    if args.format == "sqlite":
+        _process_to_sqlite(args, length_bits, total_messages)
+    else:
+        _process_to_yaml(args, length_bits, total_messages)
+
+
+def _process_to_yaml(args, length_bits: int, total_messages: int) -> None:
+    """Process messages and save to YAML format."""
     results: Dict = {
         "message_length_bits": length_bits,
         "message_length_bytes": length_bits // 8 if length_bits % 8 == 0 else f"{length_bits // 8}+{length_bits % 8}bits",
@@ -108,6 +131,7 @@ def main():
     
     print(f"Processing {total_messages:,} messages...")
     
+    sample_entries = []
     for idx, (message_bytes, binary_str) in enumerate(enumerate_messages_bits(length_bits)):
         if idx > 0 and idx % 10000 == 0:
             print(f"  Progress: {idx:,} / {total_messages:,} ({100*idx/total_messages:.1f}%)")
@@ -129,6 +153,9 @@ def main():
             entry["blocks"].append(block_entry)
         
         results["messages"].append(entry)
+        
+        if idx < 4:
+            sample_entries.append(entry)
     
     # Write to YAML file
     output_path = os.path.join(args.output_dir, f"{length_bits}.yaml")
@@ -138,10 +165,115 @@ def main():
         yaml.dump(results, f, default_flow_style=False, sort_keys=False)
     
     print(f"Done! Saved {total_messages:,} message entries to {output_path}")
+    _print_samples(sample_entries)
+
+
+def _process_to_sqlite(args, length_bits: int, total_messages: int) -> None:
+    """Process messages and save to SQLite database."""
+    output_path = os.path.join(args.output_dir, f"{length_bits}.db")
+    print(f"Processing {total_messages:,} messages to SQLite database...")
     
-    # Print some statistics
+    # Remove existing database if present
+    if os.path.exists(output_path):
+        os.remove(output_path)
+    
+    conn = sqlite3.connect(output_path)
+    cursor = conn.cursor()
+    
+    # Create tables
+    cursor.executescript("""
+        CREATE TABLE metadata (
+            message_length_bits INTEGER NOT NULL,
+            message_length_bytes TEXT NOT NULL,
+            total_messages INTEGER NOT NULL
+        );
+        
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY,
+            message_bits TEXT NOT NULL,
+            message_hex TEXT NOT NULL,
+            digest_hex TEXT NOT NULL
+        );
+        
+        CREATE TABLE h_values (
+            message_id INTEGER NOT NULL,
+            block_index INTEGER NOT NULL,
+            round_index INTEGER NOT NULL,
+            h_value TEXT NOT NULL,
+            FOREIGN KEY (message_id) REFERENCES messages(id)
+        );
+        
+        CREATE INDEX idx_h_values_message ON h_values(message_id);
+        CREATE INDEX idx_h_values_block ON h_values(message_id, block_index);
+    """)
+    
+    # Insert metadata
+    message_length_bytes = (
+        str(length_bits // 8) if length_bits % 8 == 0 
+        else f"{length_bits // 8}+{length_bits % 8}bits"
+    )
+    cursor.execute(
+        "INSERT INTO metadata VALUES (?, ?, ?)",
+        (length_bits, message_length_bytes, total_messages)
+    )
+    
+    # Process messages in batches for better performance
+    BATCH_SIZE = 1000
+    message_batch = []
+    h_value_batch = []
+    sample_entries = []
+    
+    for idx, (message_bytes, binary_str) in enumerate(enumerate_messages_bits(length_bits)):
+        if idx > 0 and idx % 10000 == 0:
+            print(f"  Progress: {idx:,} / {total_messages:,} ({100*idx/total_messages:.1f}%)")
+        
+        digest, h_values_per_block = sha256_bits_with_h_tracking(message_bytes, length_bits)
+        
+        message_hex = message_bytes.hex() if message_bytes else ""
+        digest_hex = digest.hex()
+        
+        message_batch.append((idx, binary_str, message_hex, digest_hex))
+        
+        for block_idx, h_values in enumerate(h_values_per_block):
+            for round_idx, h_value in enumerate(h_values):
+                h_value_batch.append((idx, block_idx, round_idx, f"{h_value:08x}"))
+        
+        if idx < 4:
+            sample_entries.append({
+                "message_bits": binary_str,
+                "message_hex": message_hex,
+                "digest_hex": digest_hex,
+            })
+        
+        # Commit batch periodically
+        if len(message_batch) >= BATCH_SIZE:
+            cursor.executemany(
+                "INSERT INTO messages VALUES (?, ?, ?, ?)", 
+                message_batch
+            )
+            cursor.executemany(
+                "INSERT INTO h_values VALUES (?, ?, ?, ?)", 
+                h_value_batch
+            )
+            conn.commit()
+            message_batch = []
+            h_value_batch = []
+    
+    # Insert remaining batch
+    if message_batch:
+        cursor.executemany("INSERT INTO messages VALUES (?, ?, ?, ?)", message_batch)
+        cursor.executemany("INSERT INTO h_values VALUES (?, ?, ?, ?)", h_value_batch)
+        conn.commit()
+    
+    conn.close()
+    print(f"Done! Saved {total_messages:,} message entries to {output_path}")
+    _print_samples(sample_entries)
+
+
+def _print_samples(sample_entries: List[Dict]) -> None:
+    """Print sample entries from the results."""
     print("\nSample entries:")
-    for i, sample in enumerate(results["messages"][:min(4, len(results["messages"]))]):
+    for i, sample in enumerate(sample_entries):
         print(f"  [{i}] bits={sample['message_bits'] or '(empty)':<16} hex={sample['message_hex'] or '(empty)':<8} digest={sample['digest_hex'][:16]}...")
 
 
