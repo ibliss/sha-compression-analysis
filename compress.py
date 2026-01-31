@@ -251,3 +251,71 @@ def compress64(
         return final_state, h_values
     return final_state
 
+
+def compress_n(
+    a: int,
+    b: int,
+    c: int,
+    d: int,
+    e: int,
+    f: int,
+    g: int,
+    h: int,
+    ws: Sequence[int],
+    num_rounds: int,
+    *,
+    track_h: bool = False,
+) -> Tuple[int, int, int, int, int, int, int, int] | Tuple[Tuple[int, int, int, int, int, int, int, int], List[int]]:
+    """Run num_rounds of SHA-256 compression for one block.
+
+    Parameters
+    ----------
+    a, b, c, d, e, f, g, h : int
+        Initial working state words (typically the current hash value).
+    ws : Sequence[int]
+        The message schedule words. Must have at least num_rounds words.
+    num_rounds : int
+        Number of rounds to run (1-64).
+    track_h : bool, optional
+        If True, also return the h register value at the start of each round.
+
+    Returns
+    -------
+    If track_h is False (default):
+        (a, b, c, d, e, f, g, h) : tuple[int, ...]
+            Final working state words after num_rounds rounds.
+    If track_h is True:
+        ((a, b, c, d, e, f, g, h), h_values) : tuple[tuple[int, ...], list[int]]
+            Final working state and list of h values at start of each round.
+    """
+    if num_rounds < 1 or num_rounds > 64:
+        raise ValueError(f"num_rounds must be between 1 and 64, got {num_rounds}")
+    if len(ws) < num_rounds:
+        raise ValueError(f"compress_n expects at least {num_rounds} message schedule words, got {len(ws)}")
+
+    h_values: List[int] = [] if track_h else None
+
+    a_, b_, c_, d_, e_, f_, g_, h_ = a, b, c, d, e, f, g, h
+    for i in range(num_rounds):
+        if track_h:
+            h_values.append(h_)
+        
+        a_, b_, c_, d_, e_, f_, g_, h_ = compression(
+            a_,
+            b_,
+            c_,
+            d_,
+            e_,
+            f_,
+            g_,
+            h_,
+            ws[i],
+            K_VALUES[i],
+        )
+
+    final_state = (a_ & MASK32, b_ & MASK32, c_ & MASK32, d_ & MASK32, e_ & MASK32, f_ & MASK32, g_ & MASK32, h_ & MASK32)
+    
+    if track_h:
+        return final_state, h_values
+    return final_state
+
