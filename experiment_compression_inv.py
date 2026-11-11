@@ -12,6 +12,11 @@ With `--use-h-values` flag:
 - Track h register values during forward compression using `track_h=True`.
 - Pass these h values to `compression64_inv` for exact inversion.
 - Verification still uses standard SHA functions (no h internals).
+
+With `--tail-h-values` flag:
+- Supply only `h[8..63]` to `compression64_inv`; the four prefix words
+  `h[4..7]` are solved from the endpoint instead of being given.
+- The demo prints the true and solved prefix so the match is visible.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ import argparse
 from typing import List, Optional, Tuple
 
 from compress import MASK32, compress64
-from compression_inv import compression64_inv
+from compression_inv import compression64_inv, solve_h_prefix
 from basic_inv import (
     inv_expand_message_schedule,
     inv_init_message_schedule,
@@ -40,14 +45,19 @@ def _format_state(state: Tuple[int, int, int, int, int, int, int, int]) -> str:
     return " ".join(f"{w:08x}" for w in state)
 
 
-def run_experiment(msg: bytes, *, use_h_values: bool = False) -> None:
+def run_experiment(msg: bytes, *, use_h_values: bool = False, tail_only: bool = False) -> None:
+    if tail_only:
+        use_h_values = True
+
     # Compute the expected hash for the input message.
     expected_hex = sha256(msg).hex()
 
     # High-level SHA-256 using our CLI helpers.
     initial_state, schedules = sha256_before(msg)
 
-    if use_h_values:
+    if tail_only:
+        print("=== Supplying h[8..63] only; solving h[4..7] from the endpoint ===\n")
+    elif use_h_values:
         print("=== Using h-value tracking for exact inversion ===\n")
 
     # The message "hello world" fits into a single 512-bit block after padding,
@@ -80,10 +90,21 @@ def run_experiment(msg: bytes, *, use_h_values: bool = False) -> None:
 
         # Invert the 64-round compression loop from the post-round state.
         ### XXX: inv_ws[13,14,15] must be set correctly to control the last 9 bytes of the block
-        inv_a, inv_b, inv_c, inv_d, inv_e, inv_f, inv_g, inv_h, inv_ws = compression64_inv(
-            *work_out,
-            h_values=h_values,
-        )
+        if tail_only:
+            inv_a, inv_b, inv_c, inv_d, inv_e, inv_f, inv_g, inv_h, inv_ws = compression64_inv(
+                *work_out,
+                h_values=h_values[8:],
+                initial_state=state,
+            )
+            h_full, _, _ = solve_h_prefix(work_out, h_values[8:], state)
+            print("h[4..7] true  :", " ".join(f"{w:08x}" for w in h_values[4:8]))
+            print("h[4..7] solved:", " ".join(f"{w:08x}" for w in h_full[4:8]))
+            print("h[4..7] match :", h_full[4:8] == h_values[4:8])
+        else:
+            inv_a, inv_b, inv_c, inv_d, inv_e, inv_f, inv_g, inv_h, inv_ws = compression64_inv(
+                *work_out,
+                h_values=h_values,
+            )
         inv_state = (inv_a, inv_b, inv_c, inv_d, inv_e, inv_f, inv_g, inv_h)
 
         print("recovered preimage working state:")
@@ -250,10 +271,15 @@ if __name__ == "__main__":
         help="Track h register values during forward compression and use them "
              "for exact inversion (recovers original message schedule)",
     )
+    parser.add_argument(
+        "--tail-h-values",
+        action="store_true",
+        help="Supply only h[8..63]; solve the prefix h[4..7] from the endpoint",
+    )
     args = parser.parse_args()
-    
+
     with open(args.file, "rb") as f:
         msg = f.read()
-    
-    run_experiment(msg, use_h_values=args.use_h_values)
+
+    run_experiment(msg, use_h_values=args.use_h_values, tail_only=args.tail_h_values)
 

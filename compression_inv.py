@@ -218,6 +218,127 @@ def compression_inv(
     )
 
 
+# ---------------------------------------------------------------------------
+# Solving the four-word prefix h[4..7] from the endpoint
+# ---------------------------------------------------------------------------
+#
+# The endpoint (the block's pre-round working state, i.e. its chaining value)
+# names the four prefix words directly: h[7] shifts a[0], h[6] shifts b[0],
+# h[5] shifts c[0], and h[4] shifts d[0], each with slope +1.  The solve is
+# therefore triangular: fix h[7] from a[0], then h[6] from b[0], and so on.
+# Each correction needs one backward pass, so four unknowns cost five passes
+# and no search.
+
+#: The prefix positions the endpoint names, highest index first.
+PREFIX_UNKNOWN: Tuple[int, ...] = (4, 5, 6, 7)
+
+#: h[k] enters endpoint word ENDPOINT_WORD[k] with slope +1.
+ENDPOINT_WORD = {4: 3, 5: 2, 6: 1, 7: 0}
+
+
+def _backward_walk(
+    post_state: Sequence[int],
+    h_values: Sequence[int],
+) -> Tuple[Tuple[int, int, int, int, int, int, int, int], Tuple[int, ...]]:
+    """One backward pass over 64 rounds with every h value known.
+
+    Returns the recovered pre-round state and ``w[0..63]``.
+    """
+    if len(h_values) != 64:
+        raise ValueError(f"h_values must have exactly 64 elements, got {len(h_values)}")
+
+    a_i, b_i, c_i, d_i, e_i, f_i, g_i, h_i = post_state
+    ws_rev: List[int] = []
+    for i in reversed(range(64)):
+        (
+            a_i,
+            b_i,
+            c_i,
+            d_i,
+            e_i,
+            f_i,
+            g_i,
+            h_i,
+            w_i,
+        ) = compression_inv(
+            a_i, b_i, c_i, d_i, e_i, f_i, g_i, h_i, K_VALUES[i], known_h_prev=h_values[i]
+        )
+        ws_rev.append(w_i)
+
+    state = (
+        a_i & MASK32,
+        b_i & MASK32,
+        c_i & MASK32,
+        d_i & MASK32,
+        e_i & MASK32,
+        f_i & MASK32,
+        g_i & MASK32,
+        h_i & MASK32,
+    )
+    return state, tuple(reversed(ws_rev))
+
+
+def solve_h_prefix(
+    post_state: Sequence[int],
+    h_tail: Sequence[int],
+    initial_state: Sequence[int],
+    unknown: Sequence[int] = PREFIX_UNKNOWN,
+) -> Tuple[List[int], Tuple[int, ...], Tuple[int, ...]]:
+    """Solve any subset of ``h[4..7]`` from the endpoint.
+
+    Parameters
+    ----------
+    post_state : Sequence[int]
+        The 8-word state after round 63.
+    h_tail : Sequence[int]
+        ``h[8..63]`` (56 words).  ``h[0..3]`` are the block's chaining value,
+        reversed, and are filled in from ``initial_state``.
+    initial_state : Sequence[int]
+        The block's pre-round chaining value (8 words).  This is the endpoint
+        the walk must land on; for the first block of a message it is ``H(0)``,
+        and for a later block it is the previous chaining value.
+    unknown : Sequence[int], optional
+        Which prefix words to solve, a subset of ``{4, 5, 6, 7}``.
+
+    Returns
+    -------
+    (h_values, ws, endpoint) : tuple
+        The full 64-word h schedule, the recovered message schedule, and the
+        endpoint the walk landed on.
+    """
+    post_state = tuple(int(word) & MASK32 for word in post_state)
+    initial_state = tuple(int(word) & MASK32 for word in initial_state)
+    h_tail = [int(word) & MASK32 for word in h_tail]
+    if len(post_state) != 8:
+        raise ValueError(f"post_state must have 8 words, got {len(post_state)}")
+    if len(initial_state) != 8:
+        raise ValueError(f"initial_state must have 8 words, got {len(initial_state)}")
+    if len(h_tail) != 56:
+        raise ValueError(f"h_tail must supply h[8..63] (56 words), got {len(h_tail)}")
+
+    positions = tuple(sorted(set(int(index) for index in unknown)))
+    if not set(positions) <= set(PREFIX_UNKNOWN):
+        raise ValueError(f"unknown must be a subset of {PREFIX_UNKNOWN}; got {positions}")
+
+    h_values = [0] * 64
+    for index in range(4):
+        h_values[index] = initial_state[7 - index] & MASK32
+    for offset, value in enumerate(h_tail):
+        h_values[8 + offset] = value
+    for index in positions:
+        h_values[index] = 0
+
+    # One pass per unknown, highest first: each correction is a single
+    # subtraction from the endpoint word that unknown moves.
+    for index in reversed(positions):
+        state, _ws = _backward_walk(post_state, h_values)
+        word = ENDPOINT_WORD[index]
+        h_values[index] = (initial_state[word] - state[word]) & MASK32
+
+    endpoint, ws = _backward_walk(post_state, h_values)
+    return h_values, ws, endpoint
+
+
 def compression64_inv(
     a: int,
     b: int,
@@ -229,6 +350,7 @@ def compression64_inv(
     h: int,
     *,
     h_values: Optional[Sequence[int]] = None,
+    initial_state: Optional[Sequence[int]] = None,
 ) -> Tuple[int, int, int, int, int, int, int, int, Tuple[int, ...]]:
     """Invert the full 64-round SHA-256 compression loop.
 
@@ -241,10 +363,15 @@ def compression64_inv(
     a, b, c, d, e, f, g, h : int
         32-bit words representing the *post-64-round* working state.
     h_values : Sequence[int], optional
-        If provided, must be a sequence of 64 h register values (one per round).
-        h_values[i] is the h register value at the START of round i in the
-        forward direction. When provided, these values are used directly instead
-        of heuristic guessing, enabling exact recovery of the original preimage.
+        If provided, either 64 h register values (one per round) or the 56
+        values ``h[8..63]``.  ``h_values[i]`` is the h register at the START of
+        round i in the forward direction.  With 64 words the walk is exact.
+        With 56 words the four prefix words ``h[4..7]`` are solved from the
+        endpoint instead, which requires ``initial_state``.
+    initial_state : Sequence[int], optional
+        The block's pre-round chaining value (8 words).  Required when
+        ``h_values`` supplies only ``h[8..63]``; it is the endpoint the prefix
+        solve lands on.
 
     Returns
     -------
@@ -253,8 +380,28 @@ def compression64_inv(
 
     This mirrors ``compress64`` in ``compress.py``.
     """
-    if h_values is not None and len(h_values) != 64:
-        raise ValueError(f"h_values must have exactly 64 elements, got {len(h_values)}")
+    post_state = (a, b, c, d, e, f, g, h)
+
+    if h_values is None:
+        h_full: Optional[List[int]] = None
+    else:
+        h_list = [int(word) & MASK32 for word in h_values]
+        if len(h_list) == 64:
+            h_full = h_list
+        elif len(h_list) == 56:
+            if initial_state is None:
+                raise ValueError(
+                    "initial_state is required when h_values supplies only h[8..63]"
+                )
+            _h_full, ws_solved, endpoint = solve_h_prefix(
+                post_state, h_list, initial_state
+            )
+            return (*endpoint, ws_solved)
+        else:
+            raise ValueError(
+                "h_values must supply h[0..63] (64 words) or h[8..63] (56 words), "
+                f"got {len(h_list)}"
+            )
 
     # We'll accumulate recovered w[i] from the end backwards.
     ws_rev: List[int] = []
@@ -262,7 +409,7 @@ def compression64_inv(
     a_i, b_i, c_i, d_i, e_i, f_i, g_i, h_i = a, b, c, d, e, f, g, h
     for i in reversed(range(64)):
         # Get the known h_prev for this round if provided
-        known_h = h_values[i] if h_values is not None else None
+        known_h = h_full[i] if h_full is not None else None
         
         (
             a_i,
