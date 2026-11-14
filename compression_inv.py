@@ -8,9 +8,9 @@ from __future__ import annotations
 
 from typing import List, Optional, Sequence, Tuple
 
-from compress import K_VALUES, _rotr
+from compress import K_VALUES, _rotr, compression
 
-from sha256_cli import _H0
+from sha256_cli import _H0, expand_message_schedule
 
 MASK32 = 0xFFFFFFFF
 
@@ -438,4 +438,48 @@ def compression64_inv(
         h_i & MASK32,
         ws,
     )
+
+
+def recover_from_h_4_19(
+    initial_state: Sequence[int],
+    h_mid: Sequence[int],
+) -> Tuple[List[int], Tuple[int, ...], Tuple[int, int, int, int, int, int, int, int]]:
+    """Recover a block from its initial state and ``h[4..19]`` only.
+
+    ``h[0..3]`` are the initial state reversed. Rounds 0..15 recover
+    ``W[0..15]`` by subtraction, because ``h[i+4]`` is known. The message
+    schedule then gives ``W[16..63]``, and the forward walk reads off
+    ``h[20..63]`` and the final working state.
+
+    The final working state, ``h[0..3]``, and ``h[20..63]`` are not inputs.
+    ``h_mid`` must be exactly 16 words.
+    """
+    initial = tuple(int(word) & MASK32 for word in initial_state)
+    mid = [int(word) & MASK32 for word in h_mid]
+    if len(initial) != 8:
+        raise ValueError(f"initial_state must have 8 words, got {len(initial)}")
+    if len(mid) != 16:
+        raise ValueError(f"h_mid must supply h[4..19] (16 words), got {len(mid)}")
+
+    h_known = [initial[7 - index] for index in range(4)] + mid
+
+    state = initial
+    ws_prefix: List[int] = []
+    for index in range(16):
+        a, b, c, d, e, f, g, h_reg = state
+        sigma1 = _rotr(e, 6) ^ _rotr(e, 11) ^ _rotr(e, 25)
+        ch = (e & f) ^ ((~e) & g)
+        w = (h_known[index + 4] - d - h_reg - sigma1 - ch - K_VALUES[index]) & MASK32
+        ws_prefix.append(w)
+        state = compression(a, b, c, d, e, f, g, h_reg, w, K_VALUES[index])
+
+    ws = tuple(expand_message_schedule(ws_prefix))
+
+    h_schedule: List[int] = []
+    state = initial
+    for index in range(64):
+        h_schedule.append(state[7] & MASK32)
+        state = compression(*state, ws[index], K_VALUES[index])
+
+    return h_schedule, ws, state
 
