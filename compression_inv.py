@@ -10,7 +10,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from compress import K_VALUES, _rotr, compression
 
-from sha256_cli import _H0, expand_message_schedule
+from sha256_cli import _H0, _small_sigma0, _small_sigma1, expand_message_schedule
 
 MASK32 = 0xFFFFFFFF
 
@@ -482,4 +482,125 @@ def recover_from_h_4_19(
         state = compression(*state, ws[index], K_VALUES[index])
 
     return h_schedule, ws, state
+
+
+# A 16-word h window plus the working state at its end. The inverse of those
+# rounds names W for the window; the schedule recurrence fills every other W;
+# the forward walk produces the final working state. The digest is that
+# feed-forward and is not an input. S[64] is an input only when the window
+# is h[48..63].
+H_WINDOW = 16
+
+
+def schedule_from_window(w_window: Sequence[int], window_start: int) -> List[int]:
+    """Reconstruct ``W[0..63]`` from any 16-word window ``W[k..k+15]``.
+
+    ``window_start`` is ``k``, with ``0 <= k <= 48``. The recurrence step has
+    coefficient +1 on the earliest word, so it runs backward as well as forward.
+    """
+    if not 0 <= window_start <= 64 - H_WINDOW:
+        raise ValueError(f"window_start must be 0..48, got {window_start}")
+    if len(w_window) != H_WINDOW:
+        raise ValueError(f"w_window must have {H_WINDOW} words, got {len(w_window)}")
+
+    ws = [0] * 64
+    for offset, word in enumerate(w_window):
+        ws[window_start + offset] = int(word) & MASK32
+
+    for index in range(window_start - 1, -1, -1):
+        ws[index] = (
+            ws[index + 16]
+            - _small_sigma0(ws[index + 1])
+            - ws[index + 9]
+            - _small_sigma1(ws[index + 14])
+        ) & MASK32
+    for index in range(window_start + H_WINDOW, 64):
+        ws[index] = (
+            ws[index - 16]
+            + _small_sigma0(ws[index - 15])
+            + ws[index - 7]
+            + _small_sigma1(ws[index - 2])
+        ) & MASK32
+    return ws
+
+
+def _pre_state_from_w(
+    post: Sequence[int], k: int, w: int
+) -> Tuple[int, int, int, int, int, int, int, int]:
+    """Invert one round when ``W`` is known and ``h`` is the unknown.
+
+    ``a..g`` do not depend on ``h``. The ``h = 0`` inverse returns the message
+    word paired with that choice; the true ``h`` is the difference.
+    """
+    recovered = compression_inv(*post, k, known_h_prev=0)
+    h_prev = (recovered[8] - (int(w) & MASK32)) & MASK32
+    return (
+        recovered[0],
+        recovered[1],
+        recovered[2],
+        recovered[3],
+        recovered[4],
+        recovered[5],
+        recovered[6],
+        h_prev,
+    )
+
+
+def recover_from_h_window(
+    state_at_end: Sequence[int],
+    h_window: Sequence[int],
+    window_start: int,
+) -> Tuple[
+    List[int],
+    Tuple[int, ...],
+    Tuple[int, int, int, int, int, int, int, int],
+    Tuple[int, int, int, int, int, int, int, int],
+]:
+    """Recover a block from ``h[k..k+15]`` and the working state ``S[k+16]``.
+
+    ``window_start`` is ``k``, with ``0 <= k <= 48``. ``h_window`` is those 16
+    pre-round ``h`` words. ``state_at_end`` is ``S[k+16]``, which is the final
+    working state only when ``k = 48``.
+
+    Returns ``(h_values, ws, initial_state, final_working)``. ``S[0]``, ``W``,
+    the h words outside the window, and the digest are not inputs. The digest
+    is the feed-forward ``S[0] + S[64]``. The 16 h words alone do not determine
+    the block: ``S[k+16]`` carries ``(a, b, c, d)``, which the h schedule does not.
+    """
+    if not 0 <= window_start <= 64 - H_WINDOW:
+        raise ValueError(f"window_start must be 0..48, got {window_start}")
+    end_state = tuple(int(word) & MASK32 for word in state_at_end)
+    window = [int(word) & MASK32 for word in h_window]
+    if len(end_state) != 8:
+        raise ValueError(f"state_at_end must have 8 words, got {len(end_state)}")
+    if len(window) != H_WINDOW:
+        raise ValueError(f"h_window must have {H_WINDOW} words, got {len(window)}")
+
+    end_index = window_start + H_WINDOW
+    h_values = [0] * 64
+    ws_window: List[int] = [0] * H_WINDOW
+    states: List[Tuple[int, ...]] = [()] * 65
+    states[end_index] = end_state
+
+    for index in range(end_index - 1, window_start - 1, -1):
+        h_val = window[index - window_start]
+        recovered = compression_inv(
+            *states[index + 1], K_VALUES[index], known_h_prev=h_val
+        )
+        h_values[index] = h_val
+        ws_window[index - window_start] = recovered[8]
+        states[index] = recovered[:8]
+
+    ws = schedule_from_window(ws_window, window_start)
+
+    for index in range(end_index, 64):
+        h_values[index] = states[index][7] & MASK32
+        states[index + 1] = compression(*states[index], ws[index], K_VALUES[index])
+
+    for index in range(window_start - 1, -1, -1):
+        pre = _pre_state_from_w(states[index + 1], K_VALUES[index], ws[index])
+        h_values[index] = pre[7]
+        states[index] = pre
+
+    return h_values, tuple(ws), states[0], states[64]
 
